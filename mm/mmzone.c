@@ -96,24 +96,21 @@ void lruvec_init(struct lruvec *lruvec, struct pglist_data *pgdat)
 	for_each_lru(lru)
 		INIT_LIST_HEAD(&lruvec->lists[lru]);
 
+#ifdef CONFIG_MEMCG
+	lruvec->pgdat = pgdat;
+#endif
+
 #ifdef CONFIG_LRU_GEN
-	/*
-	 * PitchKernel MGLRU Phase 1: memset above already zeroed
-	 * max_seq/min_seq/nr_pages correctly (0 is the right initial
-	 * value for all three), but list_head and spinlock_t both
-	 * require real initialization beyond zero -- a zeroed
-	 * list_head is not a valid empty list (prev/next must point
-	 * to itself), and a zeroed spinlock_t skips lockdep/debug
-	 * setup even where it happens to work at the raw-lock level.
-	 */
+	lruvec->lrugen.max_seq = 1;
+	lruvec->lrugen.min_seq[LRU_GEN_ANON] = 1;
+	lruvec->lrugen.min_seq[LRU_GEN_FILE] = 1;
+
 	{
 		int gen, type;
 
 		for (gen = 0; gen < MAX_NR_GENS; gen++)
 			for (type = 0; type < ANON_AND_FILE; type++)
 				INIT_LIST_HEAD(&lruvec->lrugen.lists[gen][type]);
-
-		spin_lock_init(&lruvec->lrugen.lock);
 	}
 #endif
 }
