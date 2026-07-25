@@ -257,19 +257,74 @@ struct zone_reclaim_stat {
 /*
  * PitchKernel MGLRU: per-lruvec generation state.
  *
- * Phase 0 scaffolding only -- this struct is embedded in struct lruvec
- * but is NOT read or written anywhere yet. It exists so later phases
- * (aging/eviction in mm/vmscan.c, mm_inline.h helpers) have a stable
- * struct layout to build against without another mmzone.h churn.
+ * Phase 1: real generation lists + sequence counters, filled in against
+ * Phase 0's LRU_GEN_WIDTH=10 / LRU_REFS_WIDTH=3 bit budget (verified on
+ * this exact munch defconfig -- see page-flags-layout.h).
  *
- * Generation lists, sequence counters (max_seq/min_seq), and per-gen
- * page counts are intentionally left unimplemented here; they are
- * added in Phase 1 alongside the aging/eviction code that actually
- * uses them, so this struct's real shape is verified against working
- * logic rather than guessed in isolation.
+ * Two evictable types only (ANON, FILE) -- matches this kernel's existing
+ * is_file_lru()/for_each_evictable_lru() split (mmzone.h enum lru_list),
+ * NOT the 4-way active/inactive split; generations replace that
+ * active/inactive distinction rather than sitting alongside it.
+ *
+ * MAX_NR_GENS is bounded by LRU_GEN_WIDTH's 10 bits (2^10 - 1 = 1023
+ * representable, generation 0 reserved as "not tracked"), but a much
+ * smaller working number is used in practice -- upstream MGLRU uses 4
+ * as the default max concurrent generations, which is what's used here.
+ * This is a runtime bound on lists[][], not a bit-width limit; it can be
+ * tuned later without touching the page->flags packing in Phase 0.
  */
+#define LRU_GEN_ANON		0
+#define LRU_GEN_FILE		1
+#define ANON_AND_FILE		2
+
+#define MAX_NR_GENS		4
+
 struct lru_gen_struct {
-	/* placeholder -- populated in Phase 1 */
+	/*
+	 * max_seq: highest generation number that has been created.
+	 * min_seq[type]: oldest generation still holding pages, per type
+	 * (anon and file age independently -- e.g. under swap pressure
+	 * anon's min_seq can lag file's).
+	 *
+	 * A page's actual generation membership is delta = max_seq -
+	 * page_gen, clamped to MAX_NR_GENS -- this indirection is why
+	 * aging (incrementing max_seq) is O(1) and does not require
+	 * relinking every page's list_head, unlike the classic active/
+	 * inactive promote/demote model this replaces.
+	 */
+	unsigned long max_seq;
+	unsigned long min_seq[ANON_AND_FILE];
+
+	/*
+	 * lists[gen][type]: one evictable page list per (generation, type)
+	 * pair. Indexed as lists[gen % MAX_NR_GENS][type], matching
+	 * max_seq/min_seq's delta-based membership scheme above.
+	 */
+	struct list_head lists[MAX_NR_GENS][ANON_AND_FILE];
+
+	/*
+	 * nr_pages[gen][type]: page count per (generation, type) bucket.
+	 * Kept alongside lists[][] rather than derived by walking the
+	 * list each time -- eviction/scan-balance decisions (Phase 2)
+	 * need this cheaply and frequently.
+	 */
+	unsigned long nr_pages[MAX_NR_GENS][ANON_AND_FILE];
+
+	/*
+	 * Locking: deliberately NOT a separate lock here. This lruvec's
+	 * owning pgdat's lru_lock (reached via lruvec->pgdat, see below)
+	 * is what protects generation list membership, nr_pages[][], and
+	 * the generation bits in page->flags -- the same lock the classic
+	 * path already uses to protect PageLRU and classic list
+	 * membership on this exact page. An earlier version of this
+	 * struct had its own spinlock here; that was found to be a real
+	 * design bug during Phase 2 review, not just redundant -- two
+	 * independent locks protecting overlapping state on the same
+	 * struct page (PageLRU bit under lru_lock, generation membership
+	 * under a separate lock) is a genuine correctness hazard, not
+	 * merely inefficient locking. See lruvec_lru_gen_lock() in
+	 * mm/vmscan.c for the accessor every MGLRU path must use.
+	 */
 };
 #endif
 
@@ -845,7 +900,7 @@ enum meminit_context {
 extern void init_currently_empty_zone(struct zone *zone, unsigned long start_pfn,
 				     unsigned long size);
 
-extern void lruvec_init(struct lruvec *lruvec);
+extern void lruvec_init(struct lruvec *lruvec, struct pglist_data *pgdat);
 
 static inline struct pglist_data *lruvec_pgdat(struct lruvec *lruvec)
 {

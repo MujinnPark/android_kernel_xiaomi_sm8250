@@ -941,6 +941,14 @@ vm_fault_t finish_mkwrite_fault(struct vm_fault *vmf);
 #define LAST_CPUPID_MASK	((1UL << LAST_CPUPID_SHIFT) - 1)
 #define KASAN_TAG_MASK		((1UL << KASAN_TAG_WIDTH) - 1)
 #define ZONEID_MASK		((1UL << ZONEID_SHIFT) - 1)
+/*
+ * PitchKernel MGLRU Phase 2: LRU_GEN_PGOFF/LRU_GEN_WIDTH were defined in
+ * Phase 0 (page-flags-layout.h) but no mask was defined alongside them --
+ * only the classic zone/node/etc fields had *_MASK companions. Added here
+ * to match the existing pattern exactly, now that Phase 2 needs it for
+ * real page->flags reads/writes.
+ */
+#define LRU_GEN_MASK		((1UL << LRU_GEN_WIDTH) - 1)
 
 static inline enum zone_type page_zonenum(const struct page *page)
 {
@@ -1258,6 +1266,37 @@ static inline void set_page_node(struct page *page, unsigned long node)
 	page->flags &= ~(NODES_MASK << NODES_PGSHIFT);
 	page->flags |= (node & NODES_MASK) << NODES_PGSHIFT;
 }
+
+#ifdef CONFIG_LRU_GEN
+/*
+ * PitchKernel MGLRU Phase 2: page->flags generation accessors.
+ *
+ * Same non-atomic read-modify-write pattern as set_page_zone/set_page_node
+ * above -- this kernel's existing convention for page->flags bitfields is
+ * that writers rely on an external lock rather than atomic bitops (e.g.
+ * zone/node are only ever set during page init, before the page is
+ * visible to concurrent access). For the generation field, which *is*
+ * written during normal runtime (every aging pass that finds a young
+ * page), the equivalent serialization is the owning lruvec's
+ * lrugen.lock. Callers MUST hold it.
+ *
+ * Generation 0 is reserved to mean "never tracked by MGLRU" (e.g. a page
+ * allocated before this walk ever reached it, or while CONFIG_LRU_GEN
+ * was compiled out) -- callers should treat gen==0 as "not yet aged"
+ * rather than a valid youngest-generation value.
+ */
+static inline unsigned long page_lru_gen(struct page *page)
+{
+	return (page->flags >> LRU_GEN_PGOFF) & LRU_GEN_MASK;
+}
+
+static inline void set_page_lru_gen(struct page *page, unsigned long gen)
+{
+	VM_BUG_ON_PAGE(gen > LRU_GEN_MASK, page);
+	page->flags &= ~(LRU_GEN_MASK << LRU_GEN_PGOFF);
+	page->flags |= (gen & LRU_GEN_MASK) << LRU_GEN_PGOFF;
+}
+#endif
 
 static inline void set_page_links(struct page *page, enum zone_type zone,
 	unsigned long node, unsigned long pfn)

@@ -886,6 +886,7 @@ config EMERGENCY_MEMORY
 config LRU_GEN
 	bool "Multi-Gen LRU (PitchKernel backport)"
 	depends on MMU
+	depends on MEMCG
 	default n
 	help
 	  Backport of the Multi-Generation LRU (MGLRU) page reclaim
@@ -897,6 +898,10 @@ config LRU_GEN
 	  with no behavioral change when enabled; later phases add the
 	  actual generation aging/eviction logic, Xiaomi RTMM reclaim
 	  hook re-threading, and memcg/sysfs integration.
+
+	  Requires MEMCG: Phase 2's locking design reaches each lruvec's
+	  owning pgdat (and its lru_lock) via the pgdat back-pointer that
+	  only exists under CONFIG_MEMCG on this tree.
 
 	  Do not enable for production builds until all phases are
 	  complete and boot/soak-tested. Default build variants should

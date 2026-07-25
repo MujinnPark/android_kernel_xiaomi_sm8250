@@ -87,7 +87,7 @@ bool memmap_valid_within(unsigned long pfn,
 }
 #endif /* CONFIG_ARCH_HAS_HOLES_MEMORYMODEL */
 
-void lruvec_init(struct lruvec *lruvec)
+void lruvec_init(struct lruvec *lruvec, struct pglist_data *pgdat)
 {
 	enum lru_list lru;
 
@@ -95,6 +95,27 @@ void lruvec_init(struct lruvec *lruvec)
 
 	for_each_lru(lru)
 		INIT_LIST_HEAD(&lruvec->lists[lru]);
+
+#ifdef CONFIG_LRU_GEN
+	/*
+	 * PitchKernel MGLRU Phase 1: memset above already zeroed
+	 * max_seq/min_seq/nr_pages correctly (0 is the right initial
+	 * value for all three), but list_head and spinlock_t both
+	 * require real initialization beyond zero -- a zeroed
+	 * list_head is not a valid empty list (prev/next must point
+	 * to itself), and a zeroed spinlock_t skips lockdep/debug
+	 * setup even where it happens to work at the raw-lock level.
+	 */
+	{
+		int gen, type;
+
+		for (gen = 0; gen < MAX_NR_GENS; gen++)
+			for (type = 0; type < ANON_AND_FILE; type++)
+				INIT_LIST_HEAD(&lruvec->lrugen.lists[gen][type]);
+
+		spin_lock_init(&lruvec->lrugen.lock);
+	}
+#endif
 }
 
 #if defined(CONFIG_NUMA_BALANCING) && !defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS)

@@ -45,6 +45,9 @@
 #include <linux/memcontrol.h>
 #include <linux/delayacct.h>
 #include <linux/sysctl.h>
+#ifdef CONFIG_LRU_GEN
+#include <linux/huge_mm.h>	/* pmd_trans_huge_lock() -- PitchKernel MGLRU aging walk */
+#endif
 #include <linux/oom.h>
 #include <linux/prefetch.h>
 #include <linux/printk.h>
@@ -2576,10 +2579,423 @@ out:
 /*
  * This is a basic per-node page freer.  Used by both kswapd and direct reclaim.
  */
+#ifdef CONFIG_LRU_GEN
+/*
+ * PitchKernel MGLRU Phase 1: aging.
+ *
+ * Walks a process's page tables, clears the hardware accessed/young bit
+ * on each present PTE, and advances any page found "young" (i.e. the bit
+ * was set before we cleared it -- meaning it was actually touched since
+ * the last walk) into the current youngest generation.
+ *
+ * This is the mechanism that replaces the classic active/inactive
+ * promote-on-reference model: instead of relying on page reclaim
+ * (shrink_page_list -> page_referenced -> rmap walk) to discover access
+ * recency reactively during memory pressure, this walk proactively
+ * refreshes generation membership on a schedule, giving eviction
+ * (Phase 2) a much cheaper and more accurate signal to act on.
+ *
+ * Locking/API pattern verified against this kernel's own
+ * mm/mempolicy.c:queue_pages_pte_range() (real, existing, working code
+ * on this exact tree) rather than assumed from upstream MGLRU, which
+ * targets a materially different (5.x+, folio-based) mm_walk API that
+ * does not exist here.
+ *
+ * NOT YET WIRED IN: nothing calls mglru_age_lruvec() as of this commit.
+ * Phase 1 stops at "this function exists and is believed correct in
+ * isolation"; the actual call site (from shrink_node_memcg's Option A
+ * branch) and the eviction function that consumes what this produces
+ * are Phase 2 work. Wiring aging in without eviction to drain the
+ * generations it creates would let generation 0's pages accumulate
+ * with nothing ever reclaiming them -- a slow, silent memory-pressure
+ * regression that would not show up in a boot test.
+ */
+
+struct mglru_walk_private {
+	struct lruvec *lruvec;
+	unsigned long next_seq;	/* generation new young pages join */
+};
+
+static int mglru_age_pte_range(pmd_t *pmd, unsigned long addr,
+				unsigned long end, struct mm_walk *walk)
+{
+	struct mglru_walk_private *priv = walk->private;
+	struct vm_area_struct *vma = walk->vma;
+	pte_t *pte, *mapped_pte;
+	spinlock_t *ptl;
+
+	ptl = pmd_trans_huge_lock(pmd, vma);
+	if (ptl) {
+		/*
+		 * THP: PitchKernel MGLRU Phase 1 does not age transparent
+		 * hugepages -- they stay on whatever generation they were
+		 * last assigned (or generation 0/untracked if never
+		 * walked). Handling THP correctly means either splitting
+		 * per-subpage accounting or tracking hpage_nr_pages()-sized
+		 * moves atomically in nr_pages[][]; both are real design
+		 * work deferred to a later pass rather than guessed here.
+		 */
+		spin_unlock(ptl);
+		return 0;
+	}
+
+	if (pmd_trans_unstable(pmd))
+		return 0;
+
+	mapped_pte = pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
+	for (; addr != end; pte++, addr += PAGE_SIZE) {
+		struct page *page;
+		int young;
+
+		if (!pte_present(*pte))
+			continue;
+
+		page = vm_normal_page(vma, addr, *pte);
+		if (!page || PageReserved(page))
+			continue;
+
+		/* Only lruvec-managed, evictable pages are ours to age. */
+		if (!PageLRU(page) || PageUnevictable(page))
+			continue;
+
+		young = ptep_test_and_clear_young(vma, addr, pte);
+		if (!young)
+			continue;
+
+		/*
+		 * Page was actually accessed since the last walk. Move it
+		 * into the current youngest generation (priv->next_seq).
+		 *
+		 * Locking: per Option 1 (Phase 2 design decision -- see the
+		 * comment on struct lru_gen_struct in mmzone.h), this uses
+		 * the page's owning lruvec's pgdat->lru_lock, the same lock
+		 * that already protects this page's PageLRU bit and classic
+		 * list membership. This page may not belong to the lruvec
+		 * this walk was started for (a process's address space can
+		 * span pages charged to different memcgs in edge cases, and
+		 * more simply, walk_page_range() does not filter by lruvec
+		 * at all) -- so we look up the page's actual owning lruvec
+		 * here rather than assume it's priv->lruvec.
+		 */
+		{
+			struct lruvec *page_lruvec;
+			unsigned long flags;
+			unsigned long old_gen;
+			int type = page_is_file_cache(page) ? LRU_GEN_FILE : LRU_GEN_ANON;
+
+			page_lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
+
+			spin_lock_irqsave(&lruvec_pgdat(page_lruvec)->lru_lock, flags);
+
+			/*
+			 * Re-check PageLRU under the lock -- it could have
+			 * been cleared (page isolated for reclaim/migration
+			 * elsewhere) between our unlocked checks above and
+			 * taking the lock just now. Skip if so; whoever
+			 * cleared it owns this page's fate now, not us.
+			 */
+			if (!PageLRU(page)) {
+				spin_unlock_irqrestore(&lruvec_pgdat(page_lruvec)->lru_lock, flags);
+				continue;
+			}
+
+			old_gen = page_lru_gen(page);
+
+			/*
+			 * old_gen == 0 means "never tracked" (Phase 0's
+			 * reserved sentinel, see set_page_lru_gen's comment
+			 * in mm.h). After the add/del choke-point fix
+			 * (mglru_add_page in mm_inline.h), every evictable
+			 * page added while CONFIG_LRU_GEN is active already
+			 * gets a real generation at add-time -- so this case
+			 * should now only occur for a page that existed
+			 * before this build/boot ever had LRU_GEN active
+			 * (not a normal steady-state occurrence under this
+			 * project's eager, build-time-decided design). The
+			 * guard below is kept regardless: harmless if it
+			 * never fires, and correct (skips decrementing a
+			 * count that was never incremented) if it does.
+			 */
+			if (old_gen != 0) {
+				unsigned long old_idx = old_gen % MAX_NR_GENS;
+
+				page_lruvec->lrugen.nr_pages[old_idx][type]--;
+			}
+
+			set_page_lru_gen(page, priv->next_seq);
+			list_move(&page->lru,
+				  &page_lruvec->lrugen.lists[priv->next_seq % MAX_NR_GENS][type]);
+			page_lruvec->lrugen.nr_pages[priv->next_seq % MAX_NR_GENS][type]++;
+
+			spin_unlock_irqrestore(&lruvec_pgdat(page_lruvec)->lru_lock, flags);
+		}
+	}
+	pte_unmap_unlock(mapped_pte, ptl);
+
+	return 0;
+}
+
+/*
+ * mglru_age_lruvec - advance one lruvec's generation aging by one pass.
+ * @lruvec: the lruvec to age
+ * @mm: the mm_struct whose page tables to walk
+ *
+ * Returns 0 on success, negative on walk failure (propagated from
+ * walk_page_range()).
+ *
+ * Caller (Phase 2's shrink_node_memcg branch point, not yet wired) is
+ * responsible for: choosing which mm(s) to walk for a given
+ * lruvec/memcg, deciding walk frequency (this function performs exactly
+ * one pass over [0, TASK_SIZE) and does not rate-limit itself), and
+ * incrementing lrugen.max_seq under lruvec->pgdat->lru_lock once the
+ * walk completes -- this function only clears young bits and moves
+ * pages into priv->next_seq's bucket; it does not itself advance
+ * max_seq, so the caller must bump it (under the same lock used for
+ * every other lrugen mutation, per the Option 1 design -- see
+ * struct lru_gen_struct in mmzone.h) for "next_seq" to become the
+ * new max_seq rather than staying one ahead of it indefinitely.
+ */
+static int __maybe_unused mglru_age_lruvec(struct lruvec *lruvec, struct mm_struct *mm)
+{
+	struct mglru_walk_private priv = {
+		.lruvec = lruvec,
+		.next_seq = lruvec->lrugen.max_seq + 1,
+	};
+	struct mm_walk walk = {
+		.pmd_entry = mglru_age_pte_range,
+		.mm = mm,
+		.private = &priv,
+	};
+	int ret;
+
+	if (!mm)
+		return -EINVAL;
+
+	/*
+	 * walk_page_range()'s real callers on this tree (mm/mempolicy.c's
+	 * queue_pages_range(), verified above) rely on mmap_sem already
+	 * being held by something further up an existing syscall path
+	 * (do_mbind() etc). This function has no such caller -- Phase 2's
+	 * caller will invoke this directly from reclaim context, not from
+	 * a syscall already holding the lock -- so it must take mmap_sem
+	 * itself. pmd_trans_huge_lock()'s VM_BUG_ON_VMA asserts this is
+	 * held; skipping this would only fail loudly under
+	 * CONFIG_DEBUG_VM and walk with an unlocked mm otherwise.
+	 */
+	if (!down_read_trylock(&mm->mmap_sem))
+		return -EBUSY;
+
+	ret = walk_page_range(0, TASK_SIZE, &walk);
+
+	up_read(&mm->mmap_sem);
+
+	return ret;
+}
+#endif /* CONFIG_LRU_GEN */
+
+#ifdef CONFIG_LRU_GEN
+/*
+ * PitchKernel MGLRU Phase 2: isolate + evict.
+ *
+ * Modeled directly on this file's own isolate_lru_pages() /
+ * shrink_inactive_list() / putback_inactive_pages() (verified real,
+ * working code on this exact tree -- see those functions above) rather
+ * than invented from scratch or assumed from upstream MGLRU, which
+ * targets a materially different (folio-based) reclaim pipeline.
+ *
+ * Deliberately reuses shrink_page_list(), putback_inactive_pages(), and
+ * __isolate_lru_page() completely unmodified: they operate on a plain
+ * detached struct list_head and individual page state, with no
+ * assumption about which list scheme (classic vs generation) a page
+ * came from. putback_inactive_pages() in particular already routes
+ * through add_page_to_lru_list(), which Phase 2's earlier fix made
+ * generation-aware -- so a page put back by it correctly rejoins
+ * lrugen.lists[][], not the classic array, with no further change
+ * needed here.
+ */
+
+static unsigned long mglru_isolate_pages(struct lruvec *lruvec,
+			unsigned long nr_to_scan, int type,
+			struct list_head *dst, unsigned long *nr_scanned)
+{
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	unsigned long gen = lruvec->lrugen.min_seq[type];
+	struct list_head *src = &lruvec->lrugen.lists[gen % MAX_NR_GENS][type];
+	unsigned long scan = 0;
+	unsigned long nr_taken = 0;
+
+	while (scan < nr_to_scan && !list_empty(src)) {
+		struct page *page = lru_to_page(src);
+
+		VM_BUG_ON_PAGE(!PageLRU(page), page);
+		VM_BUG_ON_PAGE(page_lru_gen(page) != gen, page);
+
+		scan++;
+
+		switch (__isolate_lru_page(page, 0)) {
+		case 0: {
+			unsigned long nr_pages = hpage_nr_pages(page);
+
+			nr_taken += nr_pages;
+			lruvec->lrugen.nr_pages[gen % MAX_NR_GENS][type] -= nr_pages;
+			list_move(&page->lru, dst);
+			break;
+		}
+		case -EBUSY:
+			list_move(&page->lru, src);
+			continue;
+		default:
+			BUG();
+		}
+	}
+
+	*nr_scanned = scan;
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + type, nr_taken);
+
+	return nr_taken;
+}
+
+/*
+ * mglru_evict - reclaim from one lruvec's oldest generation of one type.
+ *
+ * Returns the number of pages actually reclaimed (freed), matching
+ * shrink_inactive_list()'s return contract so shrink_node_memcg's
+ * MGLRU branch (below) can accumulate it into sc->nr_reclaimed the
+ * same way the classic path does.
+ *
+ * Unlike the classic path, this does not advance min_seq itself --
+ * min_seq only advances when a generation's bucket is fully drained
+ * (nr_pages[gen][type] reaches 0 for both types), which is a
+ * lruvec-wide decision made by the caller once per shrink_node_memcg
+ * call, not per-evict-call. See the branch point below.
+ */
+static unsigned long mglru_evict(struct lruvec *lruvec, struct scan_control *sc,
+				  int type, unsigned long nr_to_scan)
+{
+	LIST_HEAD(page_list);
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	unsigned long nr_scanned;
+	unsigned long nr_taken;
+	unsigned long nr_reclaimed;
+	struct reclaim_stat stat = {};
+
+	spin_lock_irq(&pgdat->lru_lock);
+	nr_taken = mglru_isolate_pages(lruvec, nr_to_scan, type, &page_list, &nr_scanned);
+	spin_unlock_irq(&pgdat->lru_lock);
+
+	if (nr_taken == 0)
+		return 0;
+
+	nr_reclaimed = shrink_page_list(&page_list, pgdat, sc, 0, &stat, false);
+
+	spin_lock_irq(&pgdat->lru_lock);
+	putback_inactive_pages(lruvec, &page_list);
+	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + type, -nr_taken);
+	spin_unlock_irq(&pgdat->lru_lock);
+
+	return nr_reclaimed;
+}
+
+/*
+ * mglru_shrink_node_memcg - MGLRU replacement for the classic
+ * shrink_node_memcg body, when this build has CONFIG_LRU_GEN=y.
+ *
+ * Scan-type balancing (anon vs file) here is deliberately simple --
+ * proportional to each type's current tracked page count -- and does
+ * NOT thread through Xiaomi's RTMM per-process swappiness override
+ * (the CONFIG_RTMM block and the swappiness==200 sentinel inside the
+ * classic get_scan_count(), found during the original deep scan).
+ * That re-threading was explicitly scoped as separate future work
+ * (Phase 3) when Option A was agreed: this function's job is a
+ * correct, working MGLRU reclaim path first; preserving RTMM's
+ * process-targeted tuning under MGLRU is real, separate design work,
+ * not something to approximate here.
+ */
+static void mglru_shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memcg,
+				     struct scan_control *sc, unsigned long *lru_pages)
+{
+	struct lruvec *lruvec = mem_cgroup_lruvec(pgdat, memcg);
+	unsigned long nr_reclaimed = 0;
+	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
+	unsigned long total_pages;
+	int type;
+
+	total_pages = 0;
+	for (type = 0; type < ANON_AND_FILE; type++) {
+		unsigned long gen = lruvec->lrugen.min_seq[type];
+		int gi = gen % MAX_NR_GENS;
+
+		total_pages += lruvec->lrugen.nr_pages[gi][type];
+	}
+	*lru_pages = total_pages;
+
+	if (total_pages == 0)
+		return;
+
+	while (nr_reclaimed < nr_to_reclaim && total_pages > 0) {
+		for (type = 0; type < ANON_AND_FILE; type++) {
+			unsigned long gen, avail, nr_to_scan;
+			int gi;
+			bool do_evict = false;
+
+			/*
+			 * PitchKernel MGLRU Phase 2 fix: min_seq[type] and
+			 * nr_pages[][] must be read and the min_seq advance
+			 * decided under pgdat->lru_lock -- this loop runs
+			 * with no lock of its own otherwise, and two
+			 * concurrent reclaimers (kswapd + direct reclaim is
+			 * a completely normal, expected concurrent scenario,
+			 * not an edge case) racing on an unlocked min_seq++
+			 * would corrupt generation bookkeeping. The lock is
+			 * dropped again before calling mglru_evict() below,
+			 * which takes it itself internally -- holding it
+			 * across that call would self-deadlock.
+			 */
+			spin_lock_irq(&pgdat->lru_lock);
+
+			gen = lruvec->lrugen.min_seq[type];
+			gi = gen % MAX_NR_GENS;
+			avail = lruvec->lrugen.nr_pages[gi][type];
+
+			if (avail == 0) {
+				/*
+				 * This type's oldest generation is fully
+				 * drained. Advance min_seq[type] so the next
+				 * pass looks at the next-oldest bucket,
+				 * unless we've caught up to max_seq (nothing
+				 * older left at all for this type).
+				 */
+				if (gen < lruvec->lrugen.max_seq)
+					lruvec->lrugen.min_seq[type]++;
+			} else {
+				nr_to_scan = min(avail, (unsigned long)SWAP_CLUSTER_MAX);
+				do_evict = true;
+			}
+
+			spin_unlock_irq(&pgdat->lru_lock);
+
+			if (do_evict)
+				nr_reclaimed += mglru_evict(lruvec, sc, type, nr_to_scan);
+		}
+
+		cond_resched();
+
+		total_pages = 0;
+		for (type = 0; type < ANON_AND_FILE; type++) {
+			unsigned long gen = lruvec->lrugen.min_seq[type];
+
+			total_pages += lruvec->lrugen.nr_pages[gen % MAX_NR_GENS][type];
+		}
+	}
+
+	sc->nr_reclaimed += nr_reclaimed;
+}
+#endif /* CONFIG_LRU_GEN */
+
 static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memcg,
 			      struct scan_control *sc, unsigned long *lru_pages)
 {
-	struct lruvec *lruvec = mem_cgroup_lruvec(pgdat, memcg);
+	struct lruvec *lruvec;
 	unsigned long nr[NR_LRU_LISTS];
 	unsigned long targets[NR_LRU_LISTS];
 	unsigned long nr_to_scan;
@@ -2588,6 +3004,15 @@ static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memc
 	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
 	struct blk_plug plug;
 	bool scan_adjusted;
+
+#ifdef CONFIG_LRU_GEN
+	if (IS_ENABLED(CONFIG_LRU_GEN)) {
+		mglru_shrink_node_memcg(pgdat, memcg, sc, lru_pages);
+		return;
+	}
+#endif
+
+	lruvec = mem_cgroup_lruvec(pgdat, memcg);
 
 	get_scan_count(lruvec, memcg, sc, nr, lru_pages);
 

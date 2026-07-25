@@ -4490,7 +4490,7 @@ static int alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 		return 1;
 	}
 
-	lruvec_init(&pn->lruvec);
+	lruvec_init(&pn->lruvec, NODE_DATA(node));
 	pn->usage_in_excess = 0;
 	pn->on_tree = false;
 	pn->memcg = memcg;
